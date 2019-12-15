@@ -12,6 +12,7 @@ import pdb
 from collections import deque
 from sortedcontainers import SortedDict
 import random
+import os
 
 # If an agent is in a given state and desires a given return over a given horizon,
 # which action should it take next?
@@ -33,7 +34,7 @@ class BehaviorFunc(nn.Module):
 		concat_command = torch.cat((desired_return, desired_horizon), 1)*self.command_scale
 		y = torch.sigmoid(self.fc2(concat_command))
 		x = x * y
-		return F.softmax(self.fc3(x))
+		return self.fc3(x)
 
 class UpsideDownRL(object):
 	def __init__(self, env, args):
@@ -44,7 +45,9 @@ class UpsideDownRL(object):
 		self.state_space = self.env.observation_space.shape[0]
 		self.experience	 = SortedDict()
 		self.B = BehaviorFunc(self.state_space, self.nb_actions, args).cuda()
+		self.optimizer = optim.Adam(self.B.parameters(), lr=self.args.lr)
 		self.use_random_actions = True
+		self.softmax = nn.Softmax()
 
 	def gen_episode(self, dr, dh):
 		state = self.env.reset()
@@ -58,7 +61,6 @@ class UpsideDownRL(object):
 			next_state, reward, is_terminal, _ = self.env.step(action)
 			if self.args.render:
 				self.env.render()
-
 			states.append(state)
 			actions.append(action)
 			rewards.append(reward)
@@ -93,7 +95,7 @@ class UpsideDownRL(object):
 									torch.from_numpy(np.array(desired_return, dtype=np.float32)).reshape(-1, 1).cuda(), 
 									torch.from_numpy(np.array(desired_horizon, dtype=np.float32).reshape(-1, 1)).cuda()
 								)
-
+			action_prob = self.softmax(action_prob)
 			# create a categorical distribution over action probabilities
 			dist = Categorical(action_prob)
 			action = dist.sample().item()
@@ -121,6 +123,7 @@ class UpsideDownRL(object):
 			state = []
 			dr = []
 			dh = []
+			target = []
 			indices = np.random.choice(len(experience_values), self.args.batch_size, replace=True)
 			train_episodes = [experience_values[i] for i in indices]
 			t1 = [np.random.choice(len(e[0])-2, 1)  for e in train_episodes]
@@ -129,12 +132,20 @@ class UpsideDownRL(object):
 				state.append(pair[1][0][pair[0][0]])
 				dr.append(np.sum(pair[1][2][pair[0][0]:]))
 				dh.append(len(pair[1][0])-pair[0][0])				
-
+				target.append(pair[1][1][pair[0][0]])
 		
+
+			self.optimizer.zero_grad()
 			state = torch.from_numpy(np.array(state)).cuda()
 			dr = torch.from_numpy(np.array(dr, dtype=np.float32).reshape(-1,1)).cuda()
 			dh = torch.from_numpy(np.array(dh, dtype=np.float32).reshape(-1,1)).cuda()
-			output = self.B(state, dr, dh)
+			target = torch.from_numpy(np.array(target)).long().cuda()
+			action_logits = self.B(state, dr, dh)
+			loss = nn.CrossEntropyLoss()
+			output = loss(action_logits, target).mean()
+			output.backward()
+			self.optimizer.step()
+
 
 	def evaluate(self):
 		testing_rewards = []
@@ -145,19 +156,22 @@ class UpsideDownRL(object):
 			testing_rewards.append(total_reward)
 			testing_steps.append(len(rewards))
 
+
 		print("Mean reward achieved : {}".format(np.mean(testing_rewards)))
-		
+		return np.mean(testing_rewards)
 
 	def train(self):
 		self.fill_replay_buffer()
 		iterations = 0
+		test_returns = []
 		while True:
 			self.trainBehaviorFunc()
 			self.fill_replay_buffer()
 
 			if iterations % self.args.eval_every_k_epoch == 0:
-				self.evaluate()
-
+				test_returns.append(self.evaluate())
+				torch.save(self.B.state_dict(), os.path.join(self.args.save_path, "model.pkl"))
+				np.save(os.path.join(self.args.save_path, "testing_rewards"), test_returns)
 			iterations += 1
 
 
@@ -169,17 +183,18 @@ def main():
 	parser.add_argument("--lr", type=float, default=1e-2)
 	parser.add_argument("--seed", type=int, default=123)
 	parser.add_argument("--command_scale", type=float, default=0.01)
-	parser.add_argument("--replay_buffer_capacity", type=int, default=53)#1000)
-	parser.add_argument("--explore_buffer_len", type=int, default=3)
-	parser.add_argument("--eval_every_k_epoch", type=int, default=1)
-	parser.add_argument("--evaluate_trials", type=int, default=10)
-	parser.add_argument("--batch_size", type=int, default=128)
-	parser.add_argument("--train_iter", type=int, default=25)
+	parser.add_argument("--replay_buffer_capacity", type=int, default=500)
+	parser.add_argument("--explore_buffer_len", type=int, default=20)
+	parser.add_argument("--eval_every_k_epoch", type=int, default=5)
+	parser.add_argument("--evaluate_trials", type=int, default=20)
+	parser.add_argument("--batch_size", type=int, default=1024)
+	parser.add_argument("--train_iter", type=int, default=100)
 
-	parser.add_argument("--exp_name", type=str)
+	parser.add_argument("--save_path", type=str, default="DefaultParams/")
 	
 	args = parser.parse_args()
-
+	if not os.path.exists(args.save_path):
+		os.mkdir(args.save_path)
 
 	env = gym.make("LunarLander-v2")
 	env.seed(args.seed)
